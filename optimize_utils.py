@@ -1905,21 +1905,18 @@ def init_controller_context(config_file_path=None, storage_file_path=None, expor
         raise Exception('nested.optimize: config_file_path specifying required optimization parameters is missing or '
                         'invalid.')
     config_dict = read_from_yaml(context.config_file_path)
-    if 'param_names' not in config_dict or config_dict['param_names'] is None:
-        raise Exception('nested.optimize: config_file at path: %s is missing the following required field: %s' %
-                        (context.config_file_path, 'param_names'))
-    else:
+    if 'param_names' in config_dict:
         context.param_names = config_dict['param_names']
+    else:
+        context.param_names = None
     if 'default_params' not in config_dict or config_dict['default_params'] is None:
         context.default_params = {}
     else:
         context.default_params = config_dict['default_params']
-    if 'bounds' not in config_dict or config_dict['bounds'] is None:
-        raise Exception('nested.optimize: config_file at path: %s is missing the following required field: %s' %
-                        (context.config_file_path, 'bounds'))
-    for param in context.default_params:
-        config_dict['bounds'][param] = (context.default_params[param], context.default_params[param])
-    context.bounds = [config_dict['bounds'][key] for key in context.param_names]
+    if 'bounds' in config_dict and context.param_names is not None:
+        context.bounds = [config_dict['bounds'][key] for key in context.param_names]
+    else:
+        context.bounds = [ (context.default_params[param], context.default_params[param]) for param in context.default_params ]
     if 'rel_bounds' not in config_dict or config_dict['rel_bounds'] is None:
         context.rel_bounds = None
     else:
@@ -2192,6 +2189,14 @@ def init_worker_contexts(sources, update_context_funcs, param_names, default_par
                 raise Exception('nested.optimize: init_worker_contexts: source: %s; problem executing config_worker' %
                                 source)
             config_func()
+    if context.param_names is None:
+        raise Exception('nested.optimize: config_file at path %s: context is missing the following required parameter: %s' %
+                        (context.config_file_path, 'param_names'))
+    if context.bounds is None:
+        raise Exception('nested.optimize: config_file at path %s: context is missing the following required parameter: %s' %
+                        (context.config_file_path, 'bounds'))
+
+
     sys.stdout.flush()
 
 

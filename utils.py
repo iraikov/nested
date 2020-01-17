@@ -34,8 +34,8 @@ import collections
 from collections import Iterable, defaultdict
 
 
-mpl.rcParams['svg.fonttype'] = 'none'
-mpl.rcParams['text.usetex'] = False
+#mpl.rcParams['svg.fonttype'] = 'none'
+#mpl.rcParams['text.usetex'] = False
 
 data_dir = 'data/'
 
