@@ -41,9 +41,10 @@ context = Context()
 
 @click.command(context_settings=dict(ignore_unknown_options=True, allow_extra_args=True,))
 @click.option("--config-file-path", type=click.Path(exists=True, file_okay=True, dir_okay=False), default=None)
-@click.option("--param-gen", type=str, default='PopulationAnnealing')
+@click.option("--param-gen", type=str, default='PopulationAnnealing')  # "Sobol" and "Pregenerated" also accepted
 @click.option("--analyze", is_flag=True)
 @click.option("--hot-start", is_flag=True)
+@click.option("--sobol-analysis", is_flag=True)
 @click.option("--storage-file-path", type=str, default=None)
 @click.option("--export", is_flag=True)
 @click.option("--output-dir", type=click.Path(exists=True, file_okay=False, dir_okay=True), default='data')
@@ -52,14 +53,15 @@ context = Context()
 @click.option("--disp", is_flag=True)
 @click.option("--interactive", is_flag=True)
 @click.pass_context
-def main(cli, config_file_path, param_gen, analyze, hot_start, storage_file_path, export, output_dir, export_file_path,
-         label, disp, interactive):
+def main(cli, config_file_path, param_gen, analyze, hot_start, sobol_analysis, storage_file_path, export,
+         output_dir, export_file_path, label, disp, interactive):
     """
     :param cli: :class:'click.Context': used to process/pass through unknown click arguments
     :param config_file_path: str (path)
     :param param_gen: str (must refer to callable in globals())
     :param analyze: bool
     :param hot_start: bool
+    :param sobol_analysis: bool
     :param storage_file_path: str
     :param export: bool
     :param output_dir: str
@@ -75,19 +77,22 @@ def main(cli, config_file_path, param_gen, analyze, hot_start, storage_file_path
     context.interface.start(disp=disp)
     context.interface.ensure_controller()
     init_controller_context(**kwargs)
+    start_time = time.time()
     context.interface.apply(init_worker_contexts, context.sources, context.update_context_funcs, context.param_names,
                             context.default_params, context.feature_names, context.objective_names, context.target_val,
                             context.target_range, context.export_file_path, context.output_dir, context.disp,
                             optimization_title=context.optimization_title, label=context.label, **context.kwargs)
-
+    if disp:
+        print('nested.optimize: worker initialization took %.2f s' % (time.time() - start_time))
     sys.stdout.flush()
     try:
         if not analyze:
             context.param_gen_instance = context.ParamGenClass(
                 param_names=context.param_names, feature_names=context.feature_names,
                 objective_names=context.objective_names, x0=context.x0_array, bounds=context.bounds,
-                rel_bounds=context.rel_bounds, disp=disp, hot_start=hot_start,
-                storage_file_path=context.storage_file_path, **context.kwargs)
+                rel_bounds=context.rel_bounds, disp=disp, hot_start=hot_start, analysis=sobol_analysis,
+                storage_file_path=context.storage_file_path, config_file_path=context.config_file_path,
+                **context.kwargs)
             optimize()
             context.storage = context.param_gen_instance.storage
             context.report = OptimizationReport(storage=context.storage)
@@ -99,11 +104,12 @@ def main(cli, config_file_path, param_gen, analyze, hot_start, storage_file_path
         else:
             if context.storage_file_path is not None and os.path.isfile(context.storage_file_path):
                 context.report = OptimizationReport(file_path=context.storage_file_path)
+                # TODO: implement specialist_key to analyze a specialist instead of the best model
                 context.best_indiv = context.report.survivors[0]
                 print('nested.optimize: analysis mode: best params loaded from history path: %s' %
                       context.storage_file_path)
                 context.x_array = context.best_indiv.x
-                context.x_dict = param_array_to_dict(context.x_array, context.storage.param_names)
+                context.x_dict = param_array_to_dict(context.x_array, context.report.param_names)
                 context.features = param_array_to_dict(context.best_indiv.features, context.feature_names)
                 context.objectives = param_array_to_dict(context.best_indiv.objectives, context.objective_names)
                 if disp:
@@ -315,13 +321,14 @@ def export_intermediates(x, export_file_path=None, discard=True):
         if context.disp:
             print('nested.optimize: export_intermediates: no data exported - no temp_output_data files found')
     else:
-        temp_output_path_list = list(set(temp_output_path_list))  # remove duplicates
-        merge_exported_data(temp_output_path_list, export_file_path, verbose=False)
-        if discard:
-            for temp_output_path in temp_output_path_list:
-                os.remove(temp_output_path)
-        if context.disp:
-            print('nested.optimize: exporting output to %s took %.2f s' % (export_file_path, time.time() - start_time))
+        if context.comm.rank == 0:
+            temp_output_path_list = list(set(temp_output_path_list))  # remove duplicates
+            merge_exported_data(temp_output_path_list, export_file_path, verbose=False)
+            if discard:
+                for temp_output_path in temp_output_path_list:
+                    os.remove(temp_output_path)
+            if context.disp:
+                print('nested.optimize: exporting output to %s took %.2f s' % (export_file_path, time.time() - start_time))
     sys.stdout.flush()
     if not (all([feature_name in features[0] for feature_name in context.feature_names]) and
             all([objective_name in objectives[0] for objective_name in context.objective_names])):
