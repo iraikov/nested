@@ -331,7 +331,7 @@ def param_dict_to_array(x_dict, param_names):
     return np.array([x_dict[param_name] for param_name in param_names])
 
 
-def print_param_array_like_yaml(param_array, param_names, digits=2, fil=sys.stdout):
+def print_param_array_like_yaml(param_array, param_names, digits=6, fil=sys.stdout):
     """
 
     :param param_array: dict
@@ -434,6 +434,29 @@ def defaultdict_to_dict(d):
     if isinstance(d, defaultdict):
         d = {k: defaultdict_to_dict(v) for k, v in viewitems(d)}
     return d
+
+
+def get_h5py_group(file, hierarchy, create=False):
+    """
+
+    :param file: :class: in ['h5py.File', 'h5py.Group']
+    :param hierarchy: list of str
+    :param create: bool
+    :return: :class:'h5py.Group'
+    """
+    target = file
+    for key in hierarchy:
+        if key is not None:
+            key = str(key)
+            if key not in target:
+                if create:
+                    target = target.create_group(key)
+                else:
+                    raise KeyError('get_h5py_group: target: %s does not contain key: %s; valid keys: %s' %
+                                   (target, key, list(target.keys())))
+            else:
+                target = target[key]
+    return target
 
 
 def get_h5py_attr(attrs, key):
