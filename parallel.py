@@ -151,6 +151,17 @@ class IpypInterface(object):
         print('nested: IpypInterface: process id: %i; num workers: %i' % (os.getpid(), self.num_workers))
         sys.stdout.flush()
 
+    def update_worker_contexts(self, content=None, **kwargs):
+        """
+        Data provided either through the positional argument content as a dictionary, or through kwargs, will be used to
+        update the remote Context objects found on all workers, using an apply operation.
+        :param content: dict
+        """
+        if content is None:
+            content = dict()
+        content.update(kwargs)
+        self.apply(update_worker_contexts, content)
+
     def start(self, disp=False):
         pass
 
@@ -367,6 +378,17 @@ class MPIFuturesInterface(object):
         """
         return self.apply_sync(find_nested_object, object_name)
 
+    def update_worker_contexts(self, content=None, **kwargs):
+        """
+        Data provided either through the positional argument content as a dictionary, or through kwargs, will be used to
+        update the remote Context objects found on all workers, using an apply operation.
+        :param content: dict
+        """
+        if content is None:
+            content = dict()
+        content.update(kwargs)
+        self.apply(update_worker_contexts, content)
+
     def start(self, disp=False):
         pass
 
@@ -447,6 +469,16 @@ def mpi_futures_init_workers(task_id, disp=False):
         sys.stdout.flush()
         time.sleep(0.1)
     return local_context.global_comm.rank
+
+
+def update_worker_contexts(content):
+    """
+    nested.parallel interfaces require a remote instance of Context. This method can be used by an apply operation
+    to update each remote Context with the contents of the provided content dictionary.
+    :param content: dict
+    """
+    local_context = find_context()
+    local_context.update(content)
 
 
 def find_context():
@@ -785,6 +817,33 @@ class ParallelContextInterface(object):
         """
         return self.apply_sync(find_nested_object, object_name)
 
+    def synchronize(self, func, *args, **kwargs):
+        """
+        ParallelContext contains a native method to execute a function simultaneously on all workers except the master
+        (root) rank. This method utilizes this method (pc.context) to execute a function with provided positional args
+        and named kwargs. The executed function can include MPI operations that use the global communicator
+        (interface.global_comm) to exchange data between all ranks across all ParallelContext subworlds. Unfortunately,
+        this method cannot be used to collect return values from the executed function.
+        :param func:
+        :param args:
+        :param kwargs:
+        """
+        self.pc.context(parallel_execute_wrapper, func, args, kwargs)
+        parallel_execute_wrapper(func, args, kwargs)
+
+    def update_worker_contexts(self, content=None, **kwargs):
+        """
+        Data provided either through the positional argument content as a dictionary, or through kwargs, will be used to
+        update the remote Context objects found on all ranks across all subworlds. Uses a global MPI broadcast
+        operation.
+        :param content: dict
+        """
+        if content is None:
+            content = dict()
+        content.update(kwargs)
+        self.pc.context(pc_update_worker_contexts)
+        pc_update_worker_contexts(content)
+
     def start(self, disp=False):
         if disp:
             self.print_info()
@@ -906,6 +965,19 @@ def pc_find_interface():
                         'the remote __main__ namespace')
 
 
+def pc_update_worker_contexts(content=None):
+    """
+    nested.parallel interfaces require a remote instance of Context. This method can be used to update each remote
+    Context with the contents of the provided dictionary.
+    :param content: dict
+    """
+    interface = pc_find_interface()
+    # print('Rank: %i getting here' % interface.global_comm.rank)
+    # sys.stdout.flush()
+    content = interface.global_comm.bcast(content, root=0)
+    update_worker_contexts(content)
+
+
 class SerialInterface(object):
     """
     Class provides a serial interface to locally test parallelized code on a single process.
@@ -965,6 +1037,17 @@ class SerialInterface(object):
         :return: dynamic
         """
         return [self.execute(find_nested_object, object_name)]
+
+    def update_worker_contexts(self, content=None, **kwargs):
+        """
+        Data provided either through the positional argument content as a dictionary, or through kwargs, will be used to
+        update the remote Context objects found on all workers, using an apply operation.
+        :param content: dict
+        """
+        if content is None:
+            content = dict()
+        content.update(kwargs)
+        update_worker_contexts(content)
 
     def start(self, disp=False):
         if disp:

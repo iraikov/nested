@@ -1,18 +1,16 @@
 import numpy as np
-import seaborn as sns
 from collections import defaultdict
 from scipy.stats import linregress, iqr
-from sklearn.ensemble import ExtraTreesRegressor
 import matplotlib.pyplot as plt
 from matplotlib.legend_handler import HandlerLineCollection
 from matplotlib.collections import LineCollection
 from matplotlib.patches import Rectangle
 from matplotlib.backends.backend_pdf import PdfPages
-from diversipy import psa_select
 from os import path
 import warnings
 import time
 import io
+
 
 class SensitivityAnalysis(object):
     def __init__(self, population=None, X=None, y=None, save=True, save_format='png', save_txt=True, verbose=True,
@@ -543,7 +541,7 @@ class Perturbations(object):
                                                        perturb_str, perturb_range)
         if save_path is None:
             save_path = "data/%s_perturbations.hdf5" % (
-                datetime.datetime.today().strftime('%Y%m%d_%H%M'))
+                datetime.datetime.today().strftime('%Y%m%d_%H%M%S'))
         save_pregen(explore_matrix, save_path)
         print("Perturbations saved to %s." % save_path)
 
@@ -798,6 +796,7 @@ def clean_up(neighbor_arr, X, y, X_x0, input_names, y_names, n_neighbors, r_ceil
 
 def clean_up_single_pair(first_pass_neighbors, input_idx, output_idx, X, y, X_x0, input_names, y_names, n_neighbors,
                          p_baseline, confound_baseline, rel_start, repeat, txt_file, verbose, uniform):
+    from diversipy import psa_select
     nq = [x for x in range(X.shape[1]) if x != input_idx]
     neighbors = first_pass_neighbors.copy()
     counter = 0
@@ -1367,6 +1366,9 @@ def plot_gini(X, y, input_names, y_names, inp_out_same, uniform, n_neighbors):
     :param n_neighbors: int. only used if uniform is True.
     :return:
     """
+    import seaborn as sns
+    from sklearn.ensemble import ExtraTreesRegressor
+    from diversipy import psa_select
     num_trees = 50
     tree_height = 25
     mtry = max(1, int(.1 * len(input_names)))
@@ -1477,11 +1479,15 @@ def get_param_bounds(config_file_path):
     :return: 2d array of shape (d, 2) where n is the number of parameters
     """
     from nested.utils import read_from_yaml
-    bounds_dict = read_from_yaml(config_file_path)['bounds']
+    yaml_dict = read_from_yaml(config_file_path)
+    bounds_dict = yaml_dict['bounds']
+    params = yaml_dict['param_names']
     bounds = np.zeros((len(bounds_dict), 2))
-    for i, name in enumerate(bounds_dict):
-        bounds[i] = np.array(bounds_dict[name])
-
+    for i, name in enumerate(params):
+        try:
+            bounds[i] = np.array(bounds_dict[name])
+        except KeyError:
+            raise RuntimeError("The parameter %s does not have specified bounds in the config file." % name)
     return bounds
 
 def check_parameter_bounds(bounds, center, width, param_name):
@@ -1782,17 +1788,19 @@ def get_var_idx_agnostic(var_name, input_dict, output_dict):
     elif var_name in output_dict.keys():
         return output_dict[var_name], False
 
+
 def sum_objectives(pop, n):
     summed_obj = np.zeros((n,))
     counter = 0
     for generation in pop.history:
         for datum in generation:
-            if datum.objectives is not None:
+            if datum.objectives is None:
                 summed_obj[counter] = np.NaN
             else:
                 summed_obj[counter] = sum(abs(datum.objectives))
             counter += 1
     return summed_obj
+
 
 def convert_user_query_dict(queries, input_names, y_names):
     """converts user-supplied string values to indices, with error-checking"""
@@ -1817,6 +1825,7 @@ def convert_user_query_dict(queries, input_names, y_names):
             "and the value a list of strings (dependent variables). Incorrect strings "
             "were: %s. " % incorrect_vals)
     return idxs
+
 
 def plot_r_hm(pval_matrix, coef_matrix, input_names, output_names, p_baseline=.05):
     fig, ax = plt.subplots()

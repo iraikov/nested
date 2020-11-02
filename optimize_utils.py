@@ -10,6 +10,7 @@ from copy import deepcopy
 import uuid
 import warnings
 import shutil
+import yaml
 
 
 class Individual(object):
@@ -845,7 +846,7 @@ class PopulationStorage(object):
             j = n
             while n > 0:
                 if str(gen_index) in f:
-                    print('PopulationStorage: generation %s already exported to file.')
+                    print('PopulationStorage: generation %s already exported to file.' % str(gen_index))
                 else:
                     f.create_group(str(gen_index))
                     for key in self.attributes:
@@ -1734,7 +1735,7 @@ class Pregenerated(object):
         self.storage_file_path = storage_file_path
         self.config_file_path = config_file_path
 
-        if hot_start:
+        if hot_start and os.path.isfile(storage_file_path):
             self.storage = PopulationStorage(file_path=storage_file_path)
             self.population = self.storage.history[-1]
             self.survivors = self.storage.survivors[-1]
@@ -1742,20 +1743,12 @@ class Pregenerated(object):
             self.min_objectives = self.storage.min_objectives[-1]
             self.max_objectives = self.storage.max_objectives[-1]
             if self.storage.normalize != normalize:
-                warnings.warn("Pregenerated: Warning: %s normalization was specified, but the one in the "
+                warnings.warn("Pregenerated: %s normalization was specified, but the one in the "
                               "PopulationStorage object is %s. Defaulting to the one in storage."
                               %(normalize, self.storage.normalize), Warning)
             self.normalize = self.storage.normalize
             self.objectives_stored = True
             self.pop_size = len(self.storage.history[0]) + len(self.storage.failed[0])
-            if self.pop_size != int(pop_size):
-                warnings.warn("Pregenerated: user-specified population size of %i does not match "
-                              "population size of %i in storage file. Defaulting to %i."
-                              % (pop_size, self.pop_size, self.pop_size), Warning)
-            # if hot-start is true and there is only one generation
-            # in the file *and* that generation is corrupted -- default to
-            # old pop size
-            self.user_supplied_pop_size = int(pop_size)
             self.curr_iter = len(self.storage.history)
         else:
             self.storage = PopulationStorage(param_names=param_names, feature_names=feature_names,
@@ -1789,8 +1782,7 @@ class Pregenerated(object):
         for i in range(self.start_iter, self.max_iter):
             self.curr_iter = i
             self.curr_gid_range = range(i * self.pop_size, min((i + 1) * self.pop_size, self.num_points))
-            self.population = [Individual(x=self.pregen_params[j]) for j in self.curr_gid_range]
-
+            self.population = [Individual(x=self.pregen_params[j], model_id=j) for j in self.curr_gid_range]
             self.prev_survivors = deepcopy(self.survivors)
             self.prev_specialists = deepcopy(self.specialists)
             yield [individual.x for individual in self.population], \
@@ -1896,6 +1888,7 @@ class Pregenerated(object):
     def handle_possible_corruption(self, last_gen, offset):
         corrupt = False
         must_be_populated = ['population', 'survivors', 'specialists']
+        default_pop_size = 50
         with h5py.File(self.storage_file_path, "a") as f:
             for group_name in ['population', 'survivors', 'specialists', 'prev_survivors',
                                'prev_specialists', 'failed']:
@@ -1924,7 +1917,7 @@ class Pregenerated(object):
                             self.min_objectives = []
                             self.max_objectives = []
                             self.objectives_stored = False
-                            self.pop_size = self.user_supplied_pop_size                        
+                            self.pop_size = default_pop_size
                     del f[str(last_gen)]
                     break
         return corrupt
@@ -1942,21 +1935,31 @@ class Sobol(Pregenerated):
                  config_file_path=None, evaluate=None, select=None, survival_rate=.2, fitness_range=2, pop_size=50,
                  normalize='global', specialists_survive=True, **kwargs):
         """
-        although there's overlap, the logic for self.storage is different for
-        Sobol than for Pregenerated, hence Pregen's init isn't called
 
-        :param num_models: int, upper bound for number of models.
+        :param num_models: int, upper bound for number of models. required if hot_start is False
         """
-        num_models = int(num_models)
-        self.n = num_models // (2 * len(param_names) + 2)
-
+        if not hot_start and num_models is None:
+            raise RuntimeError("Sobol: num_models must be provided.")
         if pregen_param_file_path is None:
             if hot_start:
                 raise RuntimeError("Sobol: hot-start flag provided, but pregen_param_file_path was not specified.")
-            pregen_param_file_path = "data/%s_Sobol_sequence.hdf5" % (datetime.datetime.today().strftime('%Y%m%d_%H%M'))
-        params_empty = not os.path.isfile(pregen_param_file_path)
-        if params_empty:
+            pregen_param_file_path = "data/%s_Sobol_sequence.hdf5" % (datetime.datetime.today().strftime('%Y%m%d_%H%M%S'))
+        elif not hot_start:
+            raise RuntimeError("Sobol: hot-start flag not provided, but pregen_param_file_path was specified.")
+
+        if not os.path.isfile(pregen_param_file_path):
+            if hot_start:
+                raise RuntimeError("Sobol: hot-start flag provided, but pregen_param_file_path (%s) is empty."
+                                   % pregen_param_file_path)
+            self.n = int(num_models) // (2 * len(param_names) + 2)
+            if self.n == 0:
+                raise RuntimeError(
+                    "Sobol: Too low of a ceiling on the number of models (num_models). The user specified "
+                    "at most %s models, but at least %s models are needed, preferably on the "
+                    "order of a hundred to ten thousand times that."
+                    % (num_models, 2 * len(param_names) + 2))
             self.pregen_params = generate_sobol_seq(config_file_path, self.n, pregen_param_file_path)
+
         super().__init__(
             param_names=param_names, feature_names=feature_names, objective_names=objective_names,
             hot_start=hot_start,
@@ -1966,30 +1969,29 @@ class Sobol(Pregenerated):
             pop_size=pop_size, fitness_range=fitness_range, survival_rate=survival_rate, normalize=normalize,
             specialists_survive=specialists_survive, **kwargs
         )
-        self.num_points = self.pregen_params.shape[0]
-        if num_models < self.num_points:
-            raise RuntimeError("There are %i rows of parameters in the file, yet you specified at most %i models. " \
-                               % (self.pregen_params.shape[0], num_models))
-        if self.curr_iter >= self.max_iter:
-            sobol_analysis(config_file_path, self.storage)
+        if hot_start:
+            self.n = self.compute_n()
+
+        #if self.curr_iter >= self.max_iter:
+        #    sobol_analysis(config_file_path, self.storage)
         print("Sobol: the total number of models is %i. n is %i." % (self.num_points, self.n))
         sys.stdout.flush()
 
-    def update_population(self, features, objectives):
-        """
-        finds matching individuals in PopulationStorage object modifies them.
-        also modifies hdf5 file containing the PS object
-        """
-        Pregenerated.update_population(self, features, objectives)
-        # after last iter, before it's incremented
-        if self.curr_iter >= self.max_iter - 1:  
-            print("Sobol: performing sensitivity analysis...")
-            sys.stdout.flush()
-            sobol_analysis(self.config_file_path, self.storage)
+    #def update_population(self, features, objectives):
+    #    """
+    #    finds matching individuals in PopulationStorage object modifies them.
+    #    also modifies hdf5 file containing the PS object
+    #    """
+    #    Pregenerated.update_population(self, features, objectives)
+    #    # after last iter, before it's incremented
+    #    #if self.curr_iter >= self.max_iter - 1:
+    #    #    print("Sobol: performing sensitivity analysis...")
+    #    #    sys.stdout.flush()
+    #    #    sobol_analysis(self.config_file_path, self.storage)
 
     def compute_n(self):
         """ if the user already generated a Sobol sequence, n is inferred """
-        return int(self.num_points / (2 * len(self.param_names) + 2))
+        return self.num_points // (2 * len(self.param_names) + 2)
 
 
 class OptimizationReport(object):
@@ -2018,30 +2020,45 @@ class OptimizationReport(object):
                 self.specialists[objective] = storage.specialists[-1][i]
         elif file_path is None or not os.path.isfile(file_path):
             raise RuntimeError('get_optimization_report: problem loading optimization history from the specified path: '
-                               '{!s}'.format(file_path))
+                               '%s' % file_path)
         else:
-            f = h5py.File(file_path, 'r')
-            self.sim_id = f.filename
-            self.f = f
+            with h5py.File(file_path, 'r') as f:
+                self.param_names = get_h5py_attr(f.attrs, 'param_names')
+                self.feature_names = get_h5py_attr(f.attrs, 'feature_names')
+                self.objective_names = get_h5py_attr(f.attrs, 'objective_names')
+                self.survivors = []
+                last_gen_key = str(len(f) - 1)
+                group = f[last_gen_key]['survivors']
+                for i in range(len(group)):
+                    indiv_data = group[str(i)]
+                    model_id = nan2None(indiv_data.attrs['id'])
+                    individual = Individual(indiv_data['x'][:], model_id=model_id)
+                    individual.features = indiv_data['features'][:]
+                    individual.objectives = indiv_data['objectives'][:]
+                    individual.normalized_objectives = indiv_data['normalized_objectives'][:]
+                    individual.energy = nan2None(indiv_data.attrs['energy'])
+                    individual.rank = nan2None(indiv_data.attrs['rank'])
+                    individual.distance = nan2None(indiv_data.attrs['distance'])
+                    individual.fitness = nan2None(indiv_data.attrs['fitness'])
+                    individual.survivor = nan2None(indiv_data.attrs['survivor'])
+                    self.survivors.append(individual)
+                self.specialists = dict()
+                group = f[last_gen_key]['specialists']
+                for i, objective in enumerate(self.objective_names):
+                    indiv_data = group[str(i)]
+                    model_id = nan2None(indiv_data.attrs['id'])
+                    individual = Individual(indiv_data['x'][:], model_id=model_id)
+                    individual.features = indiv_data['features'][:]
+                    individual.objectives = indiv_data['objectives'][:]
+                    individual.normalized_objectives = indiv_data['normalized_objectives'][:]
+                    individual.energy = nan2None(indiv_data.attrs['energy'])
+                    individual.rank = nan2None(indiv_data.attrs['rank'])
+                    individual.distance = nan2None(indiv_data.attrs['distance'])
+                    individual.fitness = nan2None(indiv_data.attrs['fitness'])
+                    individual.survivor = nan2None(indiv_data.attrs['survivor'])
+                    self.specialists[objective] = individual
 
-            attributes = ['param_names', 'feature_names', 'objective_names']
-            for att in attributes:
-                setattr(self, att, get_h5py_attr(f.attrs, att))
-            self.survivors = []
-
-            last_gen_key = str(len(f) - 1)
-
-            group = f[last_gen_key]['survivors']
-            for i in range(len(group)):
-                indiv_data = group[str(i)]
-                self.survivors.append(self.get_individual(indiv_data))
-
-            self.specialists = dict()
-            group = f[last_gen_key]['specialists']
-            for i, objective in enumerate(self.objective_names):
-                indiv_data = group[str(i)]
-                self.specialists[objective] = self.get_individual(indiv_data)
-
+                self.sim_id = f.filename
 
     def report(self, indiv, fil=sys.stdout):
         """
@@ -2059,107 +2076,7 @@ class OptimizationReport(object):
     def report_best(self):
         self.report(self.survivors[0])
 
-    def get_individual(self, indiv_data):
-        model_id = nan2None(indiv_data.attrs['id'])
-        individual = Individual(indiv_data['x'][:], model_id=model_id)
-        attributes = ['features', 'objectives', 'normalized_objectives']
-        attributes_vals = ['energy', 'rank', 'distance', 'fitness', 'survivor']
-        for att in attributes:
-            setattr(individual, att, indiv_data[att][:])
-        for att in attributes_vals:
-            setattr(individual, att, nan2None(indiv_data.attrs[att]))
-        return individual
-
-    def generate_model_lists(self):
-        N_specialists = len(self.specialists)
-        self.specialist_arr = np.empty(shape=(N_specialists), dtype=np.dtype([('specialist', 'S64'), ('model', 'uint32'), ('model_pos', 'uint32')]))
-
-        for i, (k,v) in enumerate(self.specialists.items()):
-            self.specialist_arr[i] = k, v.model_id, -1
-
-        uniq_spe, spe_idx, spe_inv = np.unique(self.specialist_arr['model'], return_index=True, return_inverse=True)
-        spe_model_arr = np.empty(shape=(spe_idx.size), dtype=np.dtype([('model_id', 'uint32'),('model_obj', 'O'),('specialist', np.ndarray)]))
-
-        self.spe_params = np.empty(shape=(uniq_spe.size, self.param_names.size))
-        self.spe_features = np.empty(shape=(uniq_spe.size, self.feature_names.size))
-        self.spe_objectives = np.empty(shape=(uniq_spe.size, self.objective_names.size))
-
-        spe_model_arr['model_id'] = self.specialist_arr['model'][spe_idx]
-        self.specialist_arr['model_pos'] = spe_inv
-
-        tmp_lst = [[] for i in spe_idx]
-        for i, j in enumerate(spe_inv):                                                                                                   
-            tmp_lst[j].append(i)
-
-        for i, key in enumerate(self.specialist_arr['specialist'][spe_idx]):
-            spe_model_arr['model_obj'][i] = self.specialists[key.decode()]
-            spe_model_arr['specialist'][i] = self.specialist_arr['specialist'][tmp_lst[i]]
-
-            self.spe_params[i,:] = spe_model_arr['model_obj'][i].x
-            self.spe_features[i,:] = spe_model_arr['model_obj'][i].features
-            self.spe_objectives[i,:] = spe_model_arr['model_obj'][i].objectives
-
-        self.spe_model_arr = spe_model_arr
-
-        surv_models = [model.model_id for model in self.survivors]
-        self.best_model = surv_models[0]
-        uniq_surv_tmp, surv_idx_tmp = np.unique(surv_models, return_index=True)
-        idx_distinct_surv = surv_idx_tmp[np.arange(uniq_surv_tmp.size)[np.isin(uniq_surv_tmp, uniq_spe, assume_unique=True, invert=True)]]
-        surv_model_arr = np.empty(shape=(idx_distinct_surv.size), dtype=np.dtype([('model_id', 'uint32'),('model_obj', 'O')]))
-
-        self.sur_params = np.empty(shape=(idx_distinct_surv.size, self.param_names.size))
-        self.sur_features = np.empty(shape=(idx_distinct_surv.size, self.feature_names.size))
-        self.sur_objectives = np.empty(shape=(idx_distinct_surv.size, self.objective_names.size))
-
-        for i, idx in enumerate(idx_distinct_surv):
-            surv_model_arr[i] = self.survivors[idx].model_id, self.survivors[idx]
-
-            self.sur_params[i,:] = surv_model_arr['model_obj'][i].x
-            self.sur_features[i,:] = surv_model_arr['model_obj'][i].features
-            self.sur_objectives[i,:] = surv_model_arr['model_obj'][i].objectives
-        
-        self.sur_model_arr = surv_model_arr
-
-        self.spe_sur_models = np.intersect1d(uniq_spe, uniq_surv_tmp)
-        self.best_spe = True if self.best_model in self.spe_sur_models else False
-        self.best_pos = np.where(spe_model_arr['model_id']==self.best_model)[0][0] if self.best_spe else np.where(sur_model_arr['model_id']==self.best_model)[0][0]
-
-    def get_models_arr(self):
-        if not hasattr(self, 'model_arr'):
-            mod_dtype = np.dtype([('model_id', 'uint32'), ('gen', 'U3'), ('Failed', np.bool), ('group', 'U3')])
-            N_gen = len(self.f)
-            group0 = self.f['0']
-            pop_size = len(group0['failed']) + len(group0['population'])
-            N_models = N_gen * pop_size
-            model_arr = np.empty(shape=(N_models), dtype=mod_dtype)
-            for gen in self.f:
-                gen_str = '{!s}'.format(gen)
-                for fail in self.f[gen]: 
-                    for model in self.f[gen]['failed']: 
-                        model_id = self.f[gen]['failed'][model].attrs['id'] 
-                        model_arr[model_id] = model_id, gen_str, True, '{!s}'.format(model)
-                for pop in self.f[gen]: 
-                    for model in self.f[gen]['population']: 
-                        model_id = self.f[gen]['population'][model].attrs['id'] 
-                        model_arr[model_id] = model_id, gen_str, False, '{!s}'.format(model)
-            self.model_arr = model_arr
-
-    def get_model_hier(self, model_lst):
-        if not hasattr(self, 'model_arr'):
-            self.get_models_arr()
-        return self.model_arr[model_lst]
-
-    def get_model_p0(self, model_lst):
-        popdict = {True:'failed', False:'population'}
-        N_params = len(self.param_names)
-        N_models = len(model_lst)
-        model_hier = self.get_model_hier(model_lst) 
-        p0_arr = np.empty(shape=(N_models, N_params))
-        for midx, model in enumerate(model_hier):
-            p0_arr[midx, :] = self.f[model['gen']][popdict[model['Failed']]][model['group']]['x'] 
-        return p0_arr
-
-    def generate_param_file(self, file_path=None, directory='config', ext='yaml', prefix='param_file'):
+    def generate_param_file(self, file_path=None, directory='config', ext='yaml', prefix='param_file', best=True):
         """
 
         :param file_path:
@@ -2175,14 +2092,162 @@ class OptimizationReport(object):
         data = dict()
         for model_name in self.specialists:
             data[model_name] = param_array_to_dict(self.specialists[model_name].x, self.param_names)
+        if best:
+            data['best'] = param_array_to_dict(self.survivors[0].x, self.param_names)
+
         write_to_yaml(file_path, data, convert_scalars=True)
+
+
+class StorageModelReport():
+    def __init__(self, file_path):
+
+        f = h5py.File(file_path, 'r')
+        self.sim_id = f.filename
+        self.f = f
+        group0 = self.f['0']
+        self.N_gen = len(f)
+        self.N_pop = len(group0['failed']) + len(group0['population'])
+        self.param_names = self.f.attrs['param_names']
+        self.feature_names = self.f.attrs['feature_names']
+        self.objective_names = self.f.attrs['objective_names']
+        self.N_params = len(self.param_names)
+        self.N_features = len(self.feature_names)
+        self.N_objectives = len(self.objective_names)
+        self.att_size = {'x': self.N_params, 'features': self.N_features, 'objectives': self.N_objectives, 'normalized_objectives': self.N_objectives}
+        self.hier_dtype = np.dtype([('model_id', 'uint32'), ('gen', 'U3'), ('Failed', np.bool), ('group', 'U3')]) 
+
+    def get_category_id(self, gen=None, cat='spe', lst=None):
+        cat_dict = {'spe': 'specialists', 'surv': 'survivors'}
+        val_gen = self.N_gen-1 if gen is None else gen 
+        spe_arr = np.empty(shape=self.N_objectives, dtype='uint32')
+        group = self.f['{:d}'.format(val_gen)][cat_dict[cat]]
+        for i in range(self.N_objectives):
+            spe_arr[i] = group['{:d}'.format(i)].attrs['id'] 
+        if lst is not None:
+            spe_arr = spe_arr[lst]
+        return spe_arr
+
+    def get_spe_param_arr(self, gen=None):
+        specialist_arr = np.empty(shape=(self.N_objectives), dtype=np.dtype([('model', 'uint32'), ('model_pos', 'uint32')]))
+        val_gen = self.N_gen-1 if gen is None else gen 
+        specialist_arr['model'] = self.get_category_id(gen=val_gen) 
+
+        uniq_spe, spe_idx, spe_inv = np.unique(specialist_arr['model'], return_index=True, return_inverse=True)
+        spe_model_arr = np.empty(shape=(spe_idx.size), dtype=np.dtype([('model_id', 'uint32'), ('specialist', np.ndarray)]))
+
+        spe_params = np.empty(shape=(uniq_spe.size, self.param_names.size))
+
+        spe_model_arr['model_id'] = uniq_spe 
+        specialist_arr['model_pos'] = spe_inv
+
+        tmp_lst = [[] for i in spe_idx]
+        for i, j in enumerate(spe_inv):                                                                                                   
+            tmp_lst[j].append(i)
+
+        for idx, i in enumerate(spe_idx):
+            spe_model_arr['specialist'][idx] = self.objective_names[tmp_lst[idx]]
+            spe_params[idx,:] = self.f['{:d}'.format(val_gen)]['specialists']['{:d}'.format(i)]['x'] 
+
+        return spe_model_arr, spe_params 
+
+    def get_best_model(self):
+        group = self.f['{:d}'.format(self.N_gen-1)]['survivors']['0']
+        return group.attrs['id'], np.array(group['x']), np.array(group['features']), np.array(group['objectives'])
+
+    def get_models_arr(self):
+        if not hasattr(self, 'model_arr'):
+            N_gen = self.N_gen
+            pop_size = self.N_pop 
+            N_models = self.N_gen * self.N_pop
+            model_arr = np.empty(shape=(N_models), dtype=self.hier_dtype)
+            for gen_idx, gen in enumerate(self.f):
+                mod_idx = slice(gen_idx*self.N_pop, (gen_idx+1)*self.N_pop)
+                model_arr[mod_idx] = self.get_gen_models_arr(gen) 
+            self.model_arr = model_arr
+
+    def get_gen_models_arr(self, gen):
+        gen_mod_arr = np.empty(shape=(self.N_pop), dtype=self.hier_dtype)
+        start_idx = int(gen) * self.N_pop
+        gen_str = '{!s}'.format(gen)
+        for fail in self.f[gen]: 
+            for model in self.f[gen]['failed']: 
+                model_id = self.f[gen]['failed'][model].attrs['id'] 
+                idx = model_id - start_idx 
+                gen_mod_arr[idx] = model_id, gen_str, True, '{!s}'.format(model)
+        for pop in self.f[gen]: 
+            for model in self.f[gen]['population']: 
+                model_id = self.f[gen]['population'][model].attrs['id'] 
+                idx = model_id - start_idx 
+                gen_mod_arr[idx] = model_id, gen_str, False, '{!s}'.format(model)
+        return gen_mod_arr
+
+    def get_model_hier(self, model_lst):
+        if hasattr(self, 'model_arr'):
+            self.get_models_arr()
+            mod_arr = self.model_arr[model_lst]
+        else:
+            N_models = len(model_lst)
+            mod_gen = model_lst // self.N_pop
+            uniq_gen = np.unique(mod_gen)
+            tmp_arr = np.empty(shape=(uniq_gen.size*self.N_pop), dtype=self.hier_dtype)
+            for gen_idx, gen in enumerate(uniq_gen):
+                mod_idx = slice(gen_idx*self.N_pop, (gen_idx+1)*self.N_pop)
+                tmp_arr[mod_idx] = self.get_gen_models_arr(str(gen)) 
+            mod_arr_idx = np.searchsorted(tmp_arr['model_id'], model_lst)
+            mod_arget_category_attr = tmp_arr[mod_arr_idx]
+        return mod_arr
+
+    def get_model_att(self, model_lst, att='x'):
+        popdict = {True:'failed', False:'population'}
+        N_models = len(model_lst)
+        model_hier = self.get_model_hier(model_lst) 
+        att_arr = np.empty(shape=(N_models, self.att_size[att]))
+        for midx, model in enumerate(model_hier):
+            att_arr[midx, :] = self.f[model['gen']][popdict[model['Failed']]][model['group']][att] 
+        return att_arr
+
+    def get_category_att(self, gen=None, cat='spe', att='x', lst=None):
+        cat_dict = {'spe': 'specialists', 'surv': 'survivors'}
+        val_gen = self.N_gen-1 if gen is None else gen 
+        att_arr = np.empty(shape=(self.N_objectives, self.att_size[att]))
+        group = self.f['{:d}'.format(val_gen)][cat_dict[cat]]
+        for i in range(self.N_objectives):
+            att_arr[i, :] = group['{:d}'.format(i)][att]
+        if lst is not None:
+            att_arr = p0_arr[lst, :]
+        return att_arr
+
+    def generate_param_file(self, file_path=None, best=True, keys=None, p0=None, directory='config', ext='yaml', prefix='param_file'):
+        """
+
+        :param file_path:
+        :param directory:
+        :param ext:
+        :param prefix:
+        """
+        if file_path is None:
+            # TODO: This is not general to all possible sim_ids
+            uniq_sim_id = self.sim_id.split('/')[-1].split('.')[0]
+            file_path = '{!s}/{!s}_{!s}.{!s}'.format(directory, prefix, uniq_sim_id, ext)
+
+        if keys is None and p0 is None:
+            p0 = self.get_category_att()
+            params = np.array(self.param_names, dtype='U').tolist()
+            objectives = np.array(self.objective_names, dtype='U').tolist()
+            data = {obj: {param:val for param, val in zip(params, p0[oidx,:].tolist())} for oidx, obj in enumerate(objectives)}
+            if best:
+                _, best_p0, _, _ = self.get_best_model()
+                data['best'] = {param:val for param, val in zip(params, best_p0.tolist())}
+
+        file_obj = open(file_path, 'w')
+        yaml.dump(data, file_obj)            
+        file_obj.close()
 
     def format_specialist_key(self, var, suffix='specialist'):
         return var.strip().replace('(', '').replace(')', '').replace(' ', '_')+'_{!s}'.format(suffix)
 
     def close_file(self):
         self.f.close()
-
 
 def normalize_dynamic(vals, min_val, max_val, threshold=2.):
     """
@@ -2766,11 +2831,12 @@ def init_optimize_controller_context(config_file_path=None, storage_file_path=No
                         (context.config_file_path, ', '.join(str(field) for field in missing_config)))
 
     if label is not None:
-        context.label = label
-    if 'label' not in context() or context.label is None:
-        context.label = ''
-    else:
+        context.label = '_' + label
+    elif 'label' in context() and context.label is not None:
         context.label = '_' + context.label
+    else:
+        context.label = ''
+
     if 'param_gen' in config_dict and config_dict['param_gen'] is not None:
         context.param_gen = config_dict['param_gen']
     else:
@@ -2791,7 +2857,7 @@ def init_optimize_controller_context(config_file_path=None, storage_file_path=No
         output_dir_str = context.output_dir + '/'
     if storage_file_path is not None:
         context.storage_file_path = storage_file_path
-    timestamp = datetime.datetime.today().strftime('%Y%m%d_%H%M')
+    timestamp = datetime.datetime.today().strftime('%Y%m%d_%H%M%S')
     if 'storage_file_path' not in context() or context.storage_file_path is None:
         context.storage_file_path = '%s%s_%s%s_%s_optimization_history.hdf5' % \
                                     (output_dir_str, timestamp,
@@ -2799,7 +2865,7 @@ def init_optimize_controller_context(config_file_path=None, storage_file_path=No
 
     # save config_file copy
     config_file_name = context.config_file_path.split('/')[-1]
-    config_file_copy_path = '{!s}{!s}_{!s}'.format(output_dir_str, timestamp, config_file_name)
+    config_file_copy_path = '{!s}{!s}{!s}_{!s}'.format(output_dir_str, timestamp, context.label, config_file_name)
     shutil.copy2(context.config_file_path, config_file_copy_path)
 
     context.sources = set([elem[0] for elem in context.update_context_list] + list(context.get_objectives_dict.keys()) +
@@ -3000,6 +3066,7 @@ def init_analyze_controller_context(config_file_path=None, storage_file_path=Non
         if 'model_key' in context() and context.model_key is not None and len(context.model_key) > 0:
             valid_model_keys = set(context.objective_names)
             valid_model_keys.add('best')
+            valid_model_keys.add('all')
             for this_model_key in context.model_key:
                 if str(this_model_key) not in valid_model_keys:
                     raise RuntimeError('nested.analyze: invalid model_key: %s' % str(this_model_key))
@@ -3052,11 +3119,11 @@ def init_analyze_controller_context(config_file_path=None, storage_file_path=Non
                         (context.config_file_path, ', '.join(str(field) for field in missing_config)))
 
     if label is not None:
-        context.label = label
-    if 'label' not in context() or context.label is None:
-        context.label = ''
-    else:
+        context.label = '_' + label
+    elif 'label' in context() and context.label is not None:
         context.label = '_' + context.label
+    else:
+        context.label = ''
 
     if output_dir is not None:
         context.output_dir = output_dir
@@ -3068,7 +3135,7 @@ def init_analyze_controller_context(config_file_path=None, storage_file_path=Non
         output_dir_str = context.output_dir + '/'
     if storage_file_path is not None:
         context.storage_file_path = storage_file_path
-    timestamp = datetime.datetime.today().strftime('%Y%m%d_%H%M')
+    timestamp = datetime.datetime.today().strftime('%Y%m%d_%H%M%S')
 
     if export_file_path is not None:
         context.export_file_path = export_file_path
@@ -3188,12 +3255,11 @@ def init_worker_contexts(sources, update_context_funcs, param_names, default_par
     """
     context = find_context()
 
-    if label is not None:
-        context.label = label
-    if 'label' not in context() or context.label is None:
-        label = ''
-    else:
-        label = '_' + context.label
+    if label is None:
+        if 'label' in context() and context.label is not None:
+            label = context.label
+        else:
+            label = ''
 
     if output_dir is not None:
         context.output_dir = output_dir
@@ -3204,7 +3270,7 @@ def init_worker_contexts(sources, update_context_funcs, param_names, default_par
     else:
         output_dir_str = context.output_dir + '/'
     temp_output_path = '%snested_optimize_temp_output_%s%s_pid%i_uuid%i.hdf5' % \
-                       (output_dir_str, datetime.datetime.today().strftime('%Y%m%d_%H%M'), label, os.getpid(),
+                       (output_dir_str, datetime.datetime.today().strftime('%Y%m%d_%H%M%S'), label, os.getpid(),
                         uuid.uuid1())
     context.update(locals())
     context.update(kwargs)
@@ -3347,11 +3413,12 @@ def config_optimize_interactive(source_file_name, config_file_path=None, output_
                             (context.config_file_path, ', '.join(str(field) for field in missing_config)))
 
         if label is not None:
-            context.label = label
-        if 'label' not in context() or context.label is None:
-            label = ''
-        else:
+            label = '_' + label
+        elif 'label' in context() and context.label is not None:
             label = '_' + context.label
+        else:
+            label = ''
+        context.label = label
 
         if output_dir is not None:
             context.output_dir = output_dir
@@ -3364,14 +3431,14 @@ def config_optimize_interactive(source_file_name, config_file_path=None, output_
 
         if 'temp_output_path' not in context() or context.temp_output_path is None:
             context.temp_output_path = '%s%s_pid%i_uuid%i_%s%s_temp_output.hdf5' % \
-                                       (output_dir_str, datetime.datetime.today().strftime('%Y%m%d_%H%M'), os.getpid(),
+                                       (output_dir_str, datetime.datetime.today().strftime('%Y%m%d_%H%M%S'), os.getpid(),
                                         uuid.uuid1(), context.optimization_title, label)
         context.export = export
         if export_file_path is not None:
             context.export_file_path = export_file_path
         if 'export_file_path' not in context() or context.export_file_path is None:
             context.export_file_path = '%s%s_%s%s_interactive_exported_output.hdf5' % \
-                                       (output_dir_str, datetime.datetime.today().strftime('%Y%m%d_%H%M'),
+                                       (output_dir_str, datetime.datetime.today().strftime('%Y%m%d_%H%M%S'),
                                         context.optimization_title, label)
         context.disp = disp
 
@@ -3479,22 +3546,23 @@ def config_parallel_interface(source_file_name, config_file_path=None, output_di
                         export_file_path=export_file_path, label=label, disp=disp, **kwargs)
         if interface.controller_is_worker:
             configured = True
-
+    
     context = find_context()
-    if config_file_path is not None:
-        context.config_file_path = config_file_path
-    if 'config_file_path' in context() and context.config_file_path is not None:
-        if not os.path.isfile(context.config_file_path):
-            raise Exception('nested.parallel: invalid (optional) config_file_path: %s' % context.config_file_path)
-        else:
-            config_dict = read_from_yaml(context.config_file_path)
-    else:
-        config_dict = {}
-    context.update(config_dict)
     local_source = os.path.basename(source_file_name).split('.')[0]
     m = sys.modules['__main__']
 
     if not configured:
+        if config_file_path is not None:
+            context.config_file_path = config_file_path
+        if 'config_file_path' in context() and context.config_file_path is not None:
+            if not os.path.isfile(context.config_file_path):
+                raise Exception('nested.parallel: invalid (optional) config_file_path: %s' % context.config_file_path)
+            else:
+                config_dict = read_from_yaml(context.config_file_path)
+        else:
+            config_dict = {}
+        context.update(config_dict)
+
         if 'kwargs' in config_dict and config_dict['kwargs'] is not None:
             context.kwargs = config_dict['kwargs']  # Extra arguments to be passed to imported sources
         else:
@@ -3503,11 +3571,12 @@ def config_parallel_interface(source_file_name, config_file_path=None, output_di
         context.update(context.kwargs)
 
         if label is not None:
-            context.label = label
-        if 'label' not in context() or context.label is None:
-            context.label = ''
+            label = '_' + label
+        elif 'label' in context() and context.label is not None:
+            label = '_' + context.label
         else:
-            context.label = '_' + context.label
+            label = ''
+        context.label = label
 
         if output_dir is not None:
             context.output_dir = output_dir
@@ -3520,19 +3589,27 @@ def config_parallel_interface(source_file_name, config_file_path=None, output_di
 
         if 'temp_output_path' not in context() or context.temp_output_path is None:
             context.temp_output_path = '%s%s_pid%i_uuid%i%s_temp_output.hdf5' % \
-                                       (output_dir_str, datetime.datetime.today().strftime('%Y%m%d_%H%M'), os.getpid(),
-                                        uuid.uuid1(), context.label)
+                                       (output_dir_str, datetime.datetime.today().strftime('%Y%m%d_%H%M%S'),
+                                        os.getpid(), uuid.uuid1(), context.label)
         context.export = export
         if export_file_path is not None:
             context.export_file_path = export_file_path
         if 'export_file_path' not in context() or context.export_file_path is None:
             context.export_file_path = '%s%s%s_exported_output.hdf5' % \
-                                       (output_dir_str, datetime.datetime.today().strftime('%Y%m%d_%H%M'),
+                                       (output_dir_str, datetime.datetime.today().strftime('%Y%m%d_%H%M%S'),
                                         context.label)
         context.disp = disp
 
         context.sources = [local_source]
-
+        if 'interface' in context():
+            if hasattr(context.interface, 'comm'):
+                context.comm = context.interface.comm
+            if hasattr(context.interface, 'worker_comm'):
+                context.worker_comm = context.interface.worker_comm
+            if hasattr(context.interface, 'global_comm'):
+                context.global_comm = context.interface.global_comm
+            if hasattr(context.interface, 'num_workers'):
+                context.num_workers = context.interface.num_workers
         if 'comm' not in context():
             try:
                 from mpi4py import MPI
@@ -3557,8 +3634,8 @@ def config_parallel_interface(source_file_name, config_file_path=None, output_di
             config_func()
 
 
-def merge_exported_data(context, param_arrays, model_ids, model_labels, features, objectives, export_file_path,
-                        output_dir=None, verbose=False):
+def merge_exported_data(context, param_arrays=None, model_ids=None, model_labels=None, features=None, 
+                        objectives=None, export_file_path=None, output_dir=None, verbose=False):
     """
 
     :param context: :class:'Context'
@@ -3584,6 +3661,36 @@ def merge_exported_data(context, param_arrays, model_ids, model_labels, features
     return export_file_path
 
 
+def write_merge_path_list_to_yaml(context, export_file_path=None, output_dir=None, verbose=False):
+    """
+
+    :param context: :class:'Context'
+    :param target: str (path)
+    :param output_dir: str (dir)
+    :param verbose: bool
+    """
+    if export_file_path is None:
+        if output_dir is None or not os.path.isdir(output_dir):
+            raise RuntimeError('write_merge_path_list_to_yaml: invalid output_dir: %s' % str(output_dir))
+        export_file_path = '%s/merged_exported_data_%s_%i.hdf5' % \
+                           (output_dir, datetime.datetime.today().strftime('%Y%H%M%S_%m%d'), os.getpid())
+
+    temp_output_path_list = [temp_output_path for temp_output_path in
+                             context.interface.get('context.temp_output_path')
+                             if os.path.isfile(temp_output_path)]
+    if len(temp_output_path_list) > 0:
+        merge_file_path = '%s.yaml' % context.export_file_path.split('.hdf5')[0]
+        data = {'export_file_path': export_file_path, 'temp_output_path_list': temp_output_path_list}
+        write_to_yaml(merge_file_path, data)
+        if verbose:
+            print('write_merge_path_list_to_yaml: merge_file_path_list exported to %s' % merge_file_path)
+            sys.stdout.flush()
+    else:
+        if verbose:
+            print('write_merge_path_list_to_yaml: merge_path_list not exported; empty temp_output_path_list')
+            sys.stdout.flush()
+
+
 def merge_hdf5_temp_output_files(file_path_list, export_file_path=None, output_dir=None, verbose=False, debug=False):
     """
     When evaluating models with nested.analyze, each worker can export data to its own unique .hdf5 file
@@ -3604,21 +3711,28 @@ def merge_hdf5_temp_output_files(file_path_list, export_file_path=None, output_d
         if output_dir is None or not os.path.isdir(output_dir):
             raise RuntimeError('merge_hdf5_temp_output_files: invalid output_dir: %s' % str(output_dir))
         export_file_path = '%s/merged_exported_data_%s_%i.hdf5' % \
-                           (output_dir, datetime.datetime.today().strftime('%Y%H%M_%m%d'), os.getpid())
+                           (output_dir, datetime.datetime.today().strftime('%Y%H%M%S_%m%d'), os.getpid())
     if not len(file_path_list) > 0:
         if verbose:
             print('merge_hdf5_temp_output_files: no data exported; empty file_path_list')
             sys.stdout.flush()
         return None
-
+    
+    start_time = time.time()
     with h5py.File(export_file_path, 'a') as new_f:
         for old_file_path in file_path_list:
+            current_time = time.time()
             with h5py.File(old_file_path, 'r') as old_f:
                 for group in old_f:
                     nested_merge_hdf5_groups(old_f[group], group, new_f, debug=debug)
+            if verbose:
+                print('merge_hdf5_temp_output_files: merging %s into %s took %.1f s' % 
+                      (old_file_path, export_file_path, time.time() - current_time))
+                sys.stdout.flush()
 
     if verbose:
-        print('merge_hdf5_temp_output_files: exported to file_path: %s' % export_file_path)
+        print('merge_hdf5_temp_output_files: merging temp output files into %s took %.1f s' %
+              (export_file_path, time.time() - start_time))
         sys.stdout.flush()
     return export_file_path
 
@@ -3757,17 +3871,18 @@ def sobol_analysis_helper(y_str, storage, param_names, output_names, problem):
     second_order_conf = {}
 
     X, y = pop_to_matrix(storage, 'p', y_str, ['p'], ['o'])
-    if X.shape[0] == 0:
-        warnings.warn("Sobol analysis: Warning: All models failed and were not evaluated. Skipping "
+    num_failed = sum([len(gen) for gen in storage.failed])
+    if storage.total_models == 0:
+        warnings.warn("Sobol analysis: All models failed and were not evaluated. Skipping "
                       "analysis of %s." % ('features' if y_str == 'f' else 'objectives'), Warning)
         return
-    elif X.shape[0] % (2 * len(param_names) + 2) != 0:
+    elif num_failed != 0:
         if y_str == 'f':
-            warnings.warn("Sobol analysis: Warning: Some models failed and were not evaluated. Skipping "
+            warnings.warn("Sobol analysis: Some models failed and were not evaluated. Skipping "
                           "analysis of features.", Warning)
             return
         else:
-            warnings.warn("Sobol analysis: Warning: Some models failed and were not evaluated. Setting "
+            warnings.warn("Sobol analysis: Some models failed and were not evaluated. Setting "
                           "the objectives of these models to the max objectives.", Warning)
             X, y = default_failed_to_max(X, y, storage)
 
@@ -3831,6 +3946,7 @@ def default_failed_to_max(X, y, storage):
 def save_pregen(matrix, save_path):
     with h5py.File(save_path, "w") as f:
         f.create_dataset('parameters', data=matrix)
+    print("Saved pregenerated parameters to file: %s" % save_path)
 
 
 def load_pregen(save_path):
@@ -3838,4 +3954,21 @@ def load_pregen(save_path):
     pregen_matrix = f['parameters'][:]
     f.close()
     return pregen_matrix
+
+def get_exported_model_keys(exported_file):
+    f = h5py.File(exported_file, 'r')
+    keys = f.attrs['keys']
+    keys_mod = f.attrs['keys_mod']
+    enum_model = f.attrs['enum_model']
+    f.close()
+
+    model_keys =[[] for i in enum_model]
+    for k, km in zip(keys, keys_mod):
+        midx = np.where(enum_model==km)[0][0]
+        model_keys[midx].append(k.decode())
+    return model_keys
+
+
+
+
 
